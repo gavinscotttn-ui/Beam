@@ -295,6 +295,24 @@ def test_netinfo():
           and all({"name", "kind", "ips"} <= set(i) for i in ifaces), json.dumps(ifaces)[:200])
 
 
+def test_netinfo_never_blocks():
+    real = beam.detect_interfaces
+    beam.detect_interfaces = lambda: (time.sleep(2), [{"name": "slow", "kind": "other", "ips": ["10.0.0.9"],
+                                                       "speed": 0, "gateway": True, "category": "", "index": None}])[1]
+    try:
+        n = beam.NetInfo()
+        t0 = time.time()
+        first = n.get()  # starts the slow detection in the background
+        check("network detection never holds up a request", time.time() - t0 < 0.5 and first == [] and not n.refreshed_once())
+        for _ in range(60):
+            if n.refreshed_once():
+                break
+            time.sleep(0.1)
+        check("background detection completes", n.refreshed_once() and n.find("10.0.0.9") is not None)
+    finally:
+        beam.detect_interfaces = real
+
+
 def main():
     work = Path(tempfile.mkdtemp(prefix="beam-unit-"))
     try:
@@ -304,6 +322,7 @@ def main():
         test_tokens()
         test_transfers()
         test_netinfo()
+        test_netinfo_never_blocks()
     finally:
         shutil.rmtree(work, ignore_errors=True)
     print(f"\n{'ALL PASSED' if not failures else str(len(failures)) + ' FAILED'}")

@@ -2864,12 +2864,14 @@ function offerCable(o, cur) {
   ask("This device can also reach " + (D.host || "the Beam PC") + " over a wired connection (" + o.ms.toFixed(1) + " ms against " + cur.toFixed(1) + " ms now), which is usually much faster. Switch to it?",
       { title: "Faster connection found", yes: "Switch", no: "Not now", icon: "cable" }).then(ok => { if (ok) switchTo(o); });
 }
+let pathTries = 0;
 async function checkPaths() {
   let c = null;
   try { c = JSON.parse(store.get("beam_paths") || "null"); } catch (_) {}
   if (c && Date.now() - c.at < 300000 && c.origin === location.host) { if (c.offer) offerCable(c.offer, c.cur); return; }
   let info;
   try { const r = await fetch("/api/paths", { cache: "no-store" }); if (!r.ok) return; info = await r.json(); } catch (_) { return; }
+  if (info.ready === false) { if (++pathTries < 4) setTimeout(checkPaths, 5000); return; } // Beam is still looking
   const save = (offer, cur) => store.set("beam_paths", JSON.stringify({ at: Date.now(), origin: location.host, offer, cur }));
   if (info.current && info.current.direct) { save(null, 0); return; }
   const cands = (info.others || []).slice(0, 4);
@@ -3658,7 +3660,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def api_paths(self):
         """This PC's other addresses, so the page can test for a faster (wired) route."""
-        ifaces = netinfo.get() if netinfo.cached() or netinfo.refreshed_once() else netinfo.refresh_now()
+        ifaces = netinfo.get()  # never waits: detection runs in the background (a name lookup can take ages)
         here = self.local_ip()
         cur = netinfo.find(here)
         others, seen = [], {here}
@@ -3670,7 +3672,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 others.append({"ip": ip, "kind": iface["kind"], "name": iface["name"], "direct": is_direct_link(iface)})
         self.send_json({"current": {"ip": here, "kind": cur["kind"] if cur else "",
                                     "direct": bool(cur and is_direct_link(cur))},
-                        "others": others[:6], "port": self.server.server_port})
+                        "others": others[:6], "port": self.server.server_port, "ready": netinfo.refreshed_once()})
 
     # ---- files ---------------------------------------------------------------
     def _file_target(self, sid, rel):
@@ -3915,7 +3917,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if has_pw:
                 extra.append(("Set-Cookie", session_cookie(make_session())))
             log.info("Switched connection: %s now using %s", self.client_ip(), self.local_ip())
-            return self.redirect(nxt, extra)
+            # A page rather than a redirect moves on to the destination: browsers only send
+            # the new SameSite=Strict sign-in cookie on a navigation that starts from this
+            # address, not on a redirect whose journey began at the other one.
+            u = esc(nxt)
+            doc = ('<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8">'
+                   f'<meta http-equiv="refresh" content="0; url={u}"><title>Switching | Beam</title></head>'
+                   f'<body><p>Switching to the faster connection… <a href="{u}">Continue</a></p></body></html>')
+            return self.send_bytes(200, doc.encode("utf-8"), "text/html; charset=utf-8", extra)
         return self.redirect(("/login?next=" + urllib.parse.quote(nxt, safe="")) if has_pw else nxt, extra)
 
     # ---- settings -------------------------------------------------------------

@@ -233,9 +233,10 @@ def main():
         pw = urllib.parse.urlencode({"action": "password", "password": "correct horse", "confirm": "correct horse"}).encode()
         check("password set", req("POST", "/settings", pw, fh)[0] == 303)
         token = json.loads(req("GET", "/api/handoff")[2])["token"]
-        st, h, _b = req("GET", f"/handoff?t={urllib.parse.quote(token)}&next=/settings&accent=lime")
+        st, h, body = req("GET", f"/handoff?t={urllib.parse.quote(token)}&next=/settings&accent=lime")
         cookies = h.get("Set-Cookie", "")
-        check("handoff signs this browser in", st == 303 and h.get("Location") == "/settings" and "beam_session=" in cookies, cookies)
+        check("handoff signs this browser in, then moves on by itself",
+              st == 200 and b'http-equiv="refresh" content="0; url=/settings"' in body and "beam_session=" in cookies, cookies)
         st, h, _b = req("GET", f"/handoff?t={urllib.parse.quote(token)}&next=/settings")
         check("a handoff link works only once", st == 303 and h.get("Location", "").startswith("/login"))
         for nxt in ("/\t/evil.example", "//evil.example", "/x\r\nSet-Cookie:%20a=b"):
