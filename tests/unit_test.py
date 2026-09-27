@@ -13,6 +13,7 @@ import shutil
 import string
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -265,6 +266,43 @@ def test_transfers():
     c.end(False)
     check("interrupted download reported", tr.snapshot("abcdefgh12")["1"][3] == tr.FAILED)
     check("unknown batch is empty", tr.snapshot("zzzzzzzzzz") == {})
+    tr.fail("abcdefgh12.2")
+    check("a download that couldn't start is reported failed", tr.snapshot("abcdefgh12")["2"] == [0, 0, 0, tr.FAILED])
+    tr.fail("not a tx id")
+
+    # The page's "anything new?" check: answered at once when something changed...
+    v, items = tr.watch("abcdefgh12", None)
+    t0 = time.perf_counter()
+    v2, _ = tr.watch("abcdefgh12", v - 1, 5)
+    check("watch answers at once when the version moved on", v2 == v and time.perf_counter() - t0 < 0.5)
+    # ...waits (up to the limit) when nothing did...
+    t0 = time.perf_counter()
+    v3, _ = tr.watch("abcdefgh12", v, 0.3)
+    waited = time.perf_counter() - t0
+    check("watch waits out its timeout when nothing changes", v3 == v and 0.25 < waited < 2, f"{waited:.2f}s")
+    # ...and wakes the moment a download starts or ends.
+    got = {}
+
+    def waiter():
+        t = time.perf_counter()
+        got["v"] = tr.watch("abcdefgh12", v, 5)[0]
+        got["t"] = time.perf_counter() - t
+    th = threading.Thread(target=waiter)
+    th.start()
+    time.sleep(0.15)
+    d = tr.begin("abcdefgh12.3", 10)
+    th.join(6)
+    check("watch wakes when a download starts", got.get("v") == v + 1 and got.get("t", 9) < 1.0, got)
+    th = threading.Thread(target=waiter)
+    v = got["v"]
+    th.start()
+    time.sleep(0.15)
+    d.end(True)
+    th.join(6)
+    check("watch wakes when a download ends", got.get("v") == v + 1 and got.get("t", 9) < 1.0, got)
+    t0 = time.perf_counter()
+    check("watching an unknown batch just times out empty", tr.watch("qqqqqqqqqq", 0, 0.2) == (0, {})
+          and time.perf_counter() - t0 >= 0.15)
 
 
 def test_netinfo():

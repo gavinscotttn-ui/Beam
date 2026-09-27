@@ -13,6 +13,8 @@ FASTEST TRANSFERS
   - Mark several files (Options > Mark several) and download them together.
     Beam runs a few downloads side by side, which fills a Wi-Fi link far
     better than one file at a time.
+  - If this PC is on Wi-Fi, plugging it into the router with a cable can
+    nearly double Wi-Fi download speeds (data no longer crosses the air twice).
   - For the very fastest copies, join the two PCs with a network cable.
     Beam notices the wired route and offers to switch to it. Settings >
     Connection explains the one-off Windows setting a direct cable needs.
@@ -82,11 +84,13 @@ SETTINGS_PATH = APP_DIR / "beam_settings.json"
 LOG_PATH = APP_DIR / "beam.log"
 HOSTNAME = socket.gethostname() or "localhost"
 DEFAULT_PORT = 8000
-CHUNK = 1024 * 1024                # read/write block for uploads, copies and ZIPs
+CHUNK = 1024 * 1024                # read/write block for uploads and ZIPs
 SEND_STEP = 8 * 1024 * 1024        # bytes per sendfile() call (progress granularity)
+READ_BLOCK = 4 * 1024 * 1024       # file read block for downloads where sendfile() isn't used (Windows)
 WIN_SNDBUF = 4 * 1024 * 1024       # Windows send buffer for big transfers (see tune_bulk)
 IO_TIMEOUT = 120                   # seconds a transfer may stall before Beam gives up
 KEEPALIVE_IDLE = 20                # seconds an idle browser connection is kept open
+TX_WATCH = 0.7                     # longest wait before the download queue gets a progress update
 MAX_FORM_BYTES = 64 * 1024
 MAX_PICK_BYTES = 1024 * 1024       # form listing the marked items for a ZIP
 MAX_DEPTH = 64
@@ -1388,6 +1392,28 @@ def tune_bulk(sock) -> None:
             pass
 
 
+_awake_at = 0.0
+
+
+def stay_awake() -> None:
+    """Windows only counts the keyboard and mouse as "in use", so a PC left
+    serving a long download can go to sleep halfway through it. While data is
+    moving, Beam resets the sleep countdown (at most every 30 s); once the
+    transfers stop, the PC's own sleep settings apply as normal."""
+    global _awake_at
+    if not IS_WINDOWS:
+        return
+    now = time.monotonic()
+    if now - _awake_at < 30:
+        return
+    _awake_at = now
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(0x00000001)  # ES_SYSTEM_REQUIRED, once
+    except (AttributeError, OSError):
+        pass
+
+
 def open_for_reading(path):
     """Unbuffered handle with a "reading straight through" hint, so the OS
     reads ahead in bigger pieces (a big help for USB hard drives)."""
@@ -1427,15 +1453,27 @@ def send_file(sock, fh, offset: int, count: int, progress=None) -> int:
 
 
 def _sendfile_loop(sock, fh, offset, count, progress):
-    """Linux/macOS: the kernel moves file data straight to the network (no copies)."""
+    """Linux/macOS: the kernel moves file data straight to the network (no
+    copies). On Linux Beam also asks for the next 8-16 MB of the file in
+    advance, so a hard drive serving several downloads at once reads each in
+    long stretches instead of seeking back and forth in small ones."""
     sfd, ffd, timeout = sock.fileno(), fh.fileno(), sock.gettimeout()
     sel = (selectors.PollSelector if hasattr(selectors, "PollSelector") else selectors.SelectSelector)()
-    sent = 0
+    sent, end = 0, offset + count
+    fadvise, ahead = getattr(os, "posix_fadvise", None), offset  # the file up to ahead has been asked for
     try:
         sel.register(sfd, selectors.EVENT_WRITE)
         while sent < count:
+            pos = offset + sent
+            if fadvise and ahead < end and pos + SEND_STEP >= ahead:
+                start = max(ahead, pos)
+                ahead = min(end, start + 2 * SEND_STEP)
+                try:
+                    fadvise(ffd, start, ahead - start, os.POSIX_FADV_WILLNEED)
+                except OSError:
+                    fadvise = None
             try:
-                n = os.sendfile(sfd, ffd, offset + sent, min(SEND_STEP, count - sent))
+                n = os.sendfile(sfd, ffd, pos, min(SEND_STEP, count - sent))
             except (BlockingIOError, InterruptedError):
                 if not sel.select(timeout):
                     raise socket.timeout("timed out")
@@ -1455,8 +1493,10 @@ def _sendfile_loop(sock, fh, offset, count, progress):
 
 
 def _copy_loop(sock, fh, offset, count, progress):
-    """Windows (and fallback): 1 MB reads into one reused buffer, no per-block allocations."""
-    buf = memoryview(bytearray(min(CHUNK, max(count, 1))))
+    """Windows (and fallback): 4 MB reads into one reused buffer, no per-block
+    allocations. Big reads mean fewer, longer drive reads when several
+    downloads come off one hard drive."""
+    buf = memoryview(bytearray(min(READ_BLOCK, max(count, 1))))
     fh.seek(offset)
     left = count
     while left > 0:
@@ -1478,12 +1518,19 @@ class Transfers:
     link. Browsers don't tell a page how its downloads are going, so Beam
     keeps count here: connections open per file (the page keeps the total low
     enough that browsing stays responsive), bytes sent, and whether each one
-    finished. Only small numbers, capped and expired after an hour idle."""
+    finished. Only small numbers, capped and expired after an hour idle.
+
+    Each batch also has a version number that goes up whenever a download in
+    it starts or ends. The page asks "anything new since version v?" and Beam
+    answers the moment something changes (see watch), so the next file in the
+    queue starts straight away instead of on the next timed check. With lots
+    of small files, those checks used to be most of the total time."""
     _TX = re.compile(r"([A-Za-z0-9]{8,32})\.(\d{1,5})")
     RUNNING, DONE, FAILED = 0, 1, 2
 
     def __init__(self):
         self._lock = threading.Lock()
+        self._changed = threading.Condition(self._lock)
         self._batches = {}
 
     def begin(self, tx: str, size: int):
@@ -1494,7 +1541,7 @@ class Transfers:
         now = time.time()
         with self._lock:
             self._prune(now)
-            batch = self._batches.setdefault(bid, {"at": now, "items": {}})
+            batch = self._batches.setdefault(bid, {"at": now, "v": 0, "items": {}})
             batch["at"] = now
             item = batch["items"].get(n)
             if item is None:
@@ -1504,15 +1551,39 @@ class Transfers:
             item[0] += 1
             item[2] = size
             item[3] = self.RUNNING
-        return _TxItem(self._lock, item)
+            self._bump(batch)
+        return _TxItem(self, batch, item)
+
+    def fail(self, tx: str) -> None:
+        """A queued download that couldn't start (file gone, access denied), so
+        the page can say so at once rather than after a long wait."""
+        item = self.begin(tx, 0)
+        if item:
+            item.end(False)
+
+    def _bump(self, batch) -> None:  # call with the lock held
+        batch["v"] += 1
+        self._changed.notify_all()
 
     def snapshot(self, bid: str) -> dict:
+        return self.watch(bid)[1]
+
+    def watch(self, bid: str, since=None, timeout: float = 0.0):
+        """Returns (version, items) for a batch. With since set, waits up to
+        timeout seconds for the version to move on from it first."""
+        deadline = time.monotonic() + timeout
         with self._lock:
-            batch = self._batches.get(bid)
+            while True:
+                batch = self._batches.get(bid)
+                v = batch["v"] if batch else 0
+                left = deadline - time.monotonic()
+                if since is None or v != since or left <= 0:
+                    break
+                self._changed.wait(left)
             if not batch:
-                return {}
+                return 0, {}
             batch["at"] = time.time()
-            return {str(n): list(v) for n, v in batch["items"].items()}
+            return v, {str(n): list(it) for n, it in batch["items"].items()}
 
     def _prune(self, now: float) -> None:
         if len(self._batches) < 50:
@@ -1524,20 +1595,21 @@ class Transfers:
 
 
 class _TxItem:
-    __slots__ = ("_lock", "_item")
+    __slots__ = ("_reg", "_batch", "_item")
 
-    def __init__(self, lock, item):
-        self._lock, self._item = lock, item
+    def __init__(self, reg, batch, item):
+        self._reg, self._batch, self._item = reg, batch, item
 
     def add(self, n: int) -> None:
-        with self._lock:
+        with self._reg._lock:
             self._item[1] += n
 
     def end(self, ok: bool) -> None:
-        with self._lock:
+        with self._reg._lock:
             self._item[0] = max(0, self._item[0] - 1)
             if self._item[0] == 0:
                 self._item[3] = Transfers.DONE if ok else Transfers.FAILED
+            self._reg._bump(self._batch)
 
 
 transfers = Transfers()
@@ -1740,10 +1812,23 @@ LIGHT_VARS = ("--bg:#dfe3ea;--wall:radial-gradient(900px 420px at 88% -8%,rgba(v
               "--shadow:0 12px 30px -16px rgba(30,30,60,.4);--gloss:rgba(255,255,255,.95);"
               "--tile:linear-gradient(180deg,#ffffff,#e4e7ed);--scrim:rgba(20,22,30,.45);color-scheme:light;")
 
+# The wallpaper's flowing light ribbons (a mask, so they take the theme colour).
+_RIBBON_SVG = (
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1600 1000' preserveAspectRatio='none'><g fill='none' stroke='#000'>"
+    "<path d='M-60 835C250 700 520 965 860 805S1400 565 1660 645' stroke-width='96' stroke-opacity='.09'/>"
+    "<path d='M-60 792C260 652 540 905 880 752S1420 522 1660 592' stroke-width='28' stroke-opacity='.16'/>"
+    "<g>"
+    "<path d='M-60 760C280 620 560 882 900 722S1440 482 1660 552' stroke-width='1.6' stroke-opacity='.75' vector-effect='non-scaling-stroke'/>"
+    "<path d='M-60 814C270 672 560 932 890 772S1430 542 1660 612' stroke-width='1.2' stroke-opacity='.5' vector-effect='non-scaling-stroke'/>"
+    "<path d='M-60 870C300 742 580 992 920 832S1460 602 1660 692' stroke-width='2' stroke-opacity='.35' vector-effect='non-scaling-stroke'/>"
+    "<path d='M660 -40C900 130 1210 50 1660 190' stroke-width='1' stroke-opacity='.35' vector-effect='non-scaling-stroke'/>"
+    "</g></g></svg>")
+RIBBONS = 'url("data:image/svg+xml,' + urllib.parse.quote(_RIBBON_SVG, safe=" '=/:,.-") + '")'
+
 CSS = r"""
 :root{--m:#e20074;--m-rgb:226,0,116;--hl2:#c2005f;--on-hl:#fff;--hot-d:#ff5aad;--hot-l:#b3005c;
---font:"Segoe UI","Segoe UI Variable Text",Tahoma,system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;
---chrome:Tahoma,"Segoe UI",Verdana,system-ui,-apple-system,sans-serif;--sk-h:48px}
+--font:"Segoe UI Variable Text","Segoe UI",-apple-system,BlinkMacSystemFont,Roboto,"Helvetica Neue","Noto Sans",Ubuntu,Cantarell,system-ui,sans-serif;
+--display:"Segoe UI Variable Display","Segoe UI",-apple-system,BlinkMacSystemFont,Roboto,"Helvetica Neue","Noto Sans",Ubuntu,Cantarell,system-ui,sans-serif;--sk-h:48px}
 [data-accent=orange]{--m:#ff7a00;--m-rgb:255,122,0;--hl2:#f28c28;--on-hl:#1a0b00;--hot-d:#ff9a3c;--hot-l:#a04600}
 [data-accent=aqua]{--m:#0a9ff5;--m-rgb:10,159,245;--hl2:#0064ad;--on-hl:#fff;--hot-d:#4cc3ff;--hot-l:#005c99}
 [data-accent=lime]{--m:#6ec72d;--m-rgb:110,199,45;--hl2:#7ccf35;--on-hl:#0f1a00;--hot-d:#8fe04f;--hot-l:#2e6e0a}
@@ -1762,21 +1847,28 @@ radial-gradient(760px 420px at -10% 112%,rgba(var(--m-rgb),.10),transparent 60%)
 :root{--hl:linear-gradient(180deg,rgba(255,255,255,.26) 0%,rgba(255,255,255,.08) 49%,rgba(0,0,0,0) 51%,rgba(0,0,0,.14) 100%),var(--hl2)}
 *{box-sizing:border-box}
 html,body{margin:0}
-body{font:15px/1.5 var(--font);background-color:var(--bg);background-image:var(--wall);background-attachment:fixed;color:var(--text);min-height:100vh;display:flex;flex-direction:column;
+html{scrollbar-width:thin;scrollbar-color:rgba(var(--m-rgb),.7) transparent}
+body{font:350 15px/1.5 var(--font);background-color:var(--bg);background-image:var(--wall);background-attachment:fixed;color:var(--text);min-height:100vh;display:flex;flex-direction:column;
  padding-bottom:calc(var(--sk-h) + env(safe-area-inset-bottom,0px));-webkit-font-smoothing:antialiased}
+body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.55;
+ background:linear-gradient(100deg,rgba(var(--m-rgb),.25) 0%,var(--m) 38%,#fff 58%,var(--m) 74%,rgba(var(--m-rgb),.3) 100%);
+ -webkit-mask:/*RIBBONS*/ 0 0/100% 100% no-repeat;mask:/*RIBBONS*/ 0 0/100% 100% no-repeat}
+[data-theme=light] body::before{opacity:.4}
+@media (prefers-color-scheme:light){[data-theme=system] body::before{opacity:.4}}
+b,strong{font-weight:600}
 a{color:var(--hot);text-decoration:none}
 a:hover{text-decoration:underline}
 :focus-visible{outline:2px solid var(--hot);outline-offset:2px}
 button{font-family:inherit}
 code{font-family:Consolas,"Cascadia Mono",monospace;font-size:13.5px;color:var(--hot);word-break:break-all}
-kbd{font:600 12px var(--chrome);padding:1px 7px;border-radius:5px;border:1px solid var(--line-hi);background:var(--solid);box-shadow:inset 0 -1px 0 var(--line-hi)}
+kbd{font:500 12px var(--font);padding:1px 7px;border-radius:5px;border:1px solid var(--line-hi);background:var(--solid);box-shadow:inset 0 -1px 0 var(--line-hi)}
 .vh{position:absolute!important;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 .ic{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex:none}
 .fi{width:24px;height:24px;flex:none;filter:drop-shadow(0 1px 1px rgba(0,0,0,.35))}
 .fi.lg{width:52px;height:52px;filter:drop-shadow(0 3px 5px rgba(0,0,0,.45))}
 /* ---- status bar ---- */
 .top{position:sticky;top:0;z-index:30}
-.sbar{display:flex;align-items:center;gap:12px;height:24px;padding:0 14px;background:var(--sbar);color:var(--sbar-text);font:700 12px/1 var(--chrome);letter-spacing:.3px;border-bottom:1px solid rgba(255,255,255,.04)}
+.sbar{display:flex;align-items:center;gap:12px;height:24px;padding:0 14px;background:var(--sbar);color:var(--sbar-text);font:600 12px/1 var(--font);letter-spacing:.4px;border-bottom:1px solid rgba(255,255,255,.04)}
 .sbar .op{text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .sbar .gap{flex:1}
 .sig{display:inline-flex;align-items:flex-end;gap:1.5px;height:12px;flex:none}
@@ -1803,8 +1895,8 @@ kbd{font:600 12px var(--chrome);padding:1px 7px;border-radius:5px;border:1px sol
  box-shadow:0 0 0 1px rgba(0,0,0,.55),0 0 18px rgba(var(--m-rgb),.6),inset 0 -3px 7px rgba(0,0,0,.35)}
 .orb::after{content:"";position:absolute;left:18%;right:18%;top:7%;height:44%;border-radius:50%;background:linear-gradient(180deg,rgba(255,255,255,.92),rgba(255,255,255,.06))}
 .orb.big{width:72px;height:72px;margin-bottom:12px}
-.brand b{display:block;font:300 21px/1.1 var(--font);letter-spacing:.6px}
-.brand small{display:block;font:11.5px var(--chrome);color:var(--muted)}
+.brand b{display:block;font:200 25px/1.05 var(--display);letter-spacing:1px}
+.brand small{display:block;font:400 10.5px/1.4 var(--font);letter-spacing:1.6px;text-transform:uppercase;color:var(--muted)}
 .search{position:relative;flex:1;max-width:640px;margin:0 auto;display:flex;align-items:center}
 .search>.ic{position:absolute;left:14px;color:var(--muted);pointer-events:none}
 .search input{width:100%;height:40px;padding:0 16px 0 42px;border-radius:20px;border:1px solid var(--line-hi);background:var(--input);color:var(--text);font:inherit;box-shadow:inset 0 2px 5px rgba(0,0,0,.35)}
@@ -1820,28 +1912,33 @@ kbd{font:600 12px var(--chrome);padding:1px 7px;border-radius:5px;border:1px sol
 .live a{display:flex;align-items:center;gap:11px;padding:8px 10px;border-radius:9px;color:var(--text)}
 .live a:hover,.live a[aria-selected=true]{background:var(--hl);color:var(--on-hl);text-decoration:none}
 .live a:hover small,.live a[aria-selected=true] small{color:inherit;opacity:.85}
-.live .more{justify-content:center;color:var(--hot);font-weight:600}
+.live .more{justify-content:center;color:var(--hot);font-weight:500}
 .hint{padding:10px 12px;color:var(--muted);font-size:13.5px}
 .t{display:flex;flex-direction:column;min-width:0}
 .t .n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.t small{color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.t small{color:var(--muted);font-size:12px;font-weight:400;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* ---- page ---- */
-.wrap{width:100%;max-width:1120px;margin:0 auto;padding:22px 20px 40px;flex:1}
+.wrap{width:100%;max-width:1120px;margin:0 auto;padding:22px 20px 40px;flex:1;animation:rise .16s ease-out}
+@keyframes rise{from{opacity:.35;transform:translateY(5px)}}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow),inset 0 1px 0 var(--gloss)}
 .head{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:16px}
-.title{display:flex;align-items:center;gap:10px;font-size:28px;font-weight:300;letter-spacing:.2px;margin:0;line-height:1.2;overflow-wrap:anywhere}
-.meta{color:var(--muted);font-size:13.5px;margin-top:4px}
-.crumbs{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:13.5px;margin-bottom:4px}
+.title{display:flex;align-items:center;gap:12px;font:200 36px/1.12 var(--display);letter-spacing:.4px;margin:0;overflow-wrap:anywhere}
+.meta{color:var(--muted);font-size:13.5px;font-weight:400;margin-top:6px}
+.standby{text-align:right;line-height:1;user-select:none;-webkit-user-select:none}
+.standby b{display:block;font:100 68px/.92 var(--display);letter-spacing:1px;font-variant-numeric:tabular-nums;
+ background:linear-gradient(180deg,var(--text) 50%,var(--hot));-webkit-background-clip:text;background-clip:text;color:transparent}
+.standby small{display:block;margin-top:8px;font:300 16px var(--display);letter-spacing:.6px;color:var(--muted)}
+.crumbs{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:13.5px;font-weight:400;margin-bottom:6px}
 .crumbs a{color:var(--muted)}.crumbs a:hover{color:var(--hot)}
 .crumbs .sep{color:var(--m)}
 .actions{display:flex;gap:8px;flex-wrap:wrap}
 .strip{display:flex;align-items:center;gap:10px;min-height:34px;padding:0 14px;border-radius:13px 13px 0 0;border-bottom:1px solid var(--line);
- background:linear-gradient(180deg,var(--gloss),transparent),rgba(var(--m-rgb),.10);font:700 13px var(--chrome);letter-spacing:.3px}
+ background:linear-gradient(180deg,var(--gloss),transparent),rgba(var(--m-rgb),.10);font:400 14px var(--font);letter-spacing:.5px}
 .strip .grow{flex:1}
-#cap{font-weight:400;color:var(--hot);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#cap{font-weight:350;color:var(--hot);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 /* ---- buttons ---- */
 .btn{display:inline-flex;align-items:center;gap:8px;height:36px;padding:0 16px;border-radius:18px;border:1px solid rgba(0,0,0,.35);background:var(--hl);color:var(--on-hl);
- font:700 13.5px var(--chrome);letter-spacing:.2px;cursor:pointer;white-space:nowrap;text-shadow:0 1px 1px rgba(0,0,0,.18);box-shadow:inset 0 1px 0 rgba(255,255,255,.45),0 5px 14px -7px rgba(var(--m-rgb),.9)}
+ font:500 14px var(--font);letter-spacing:.3px;cursor:pointer;white-space:nowrap;text-shadow:0 1px 1px rgba(0,0,0,.18);box-shadow:inset 0 1px 0 rgba(255,255,255,.45),0 5px 14px -7px rgba(var(--m-rgb),.9)}
 .btn:hover{filter:brightness(1.07);text-decoration:none}
 .btn:active{filter:brightness(.94);transform:translateY(1px)}
 .btn .ic{width:18px;height:18px}
@@ -1853,7 +1950,7 @@ fieldset[disabled] .btn,.btn:disabled{opacity:.45;cursor:not-allowed;filter:none
 /* ---- tabs (drives, settings) ---- */
 .tabs{display:flex;align-items:center;gap:4px;margin:0 0 12px;padding:4px;border-radius:12px;background:var(--input);border:1px solid var(--line);overflow-x:auto;scrollbar-width:none}
 .tabs::-webkit-scrollbar{display:none}
-.tab{display:inline-flex;align-items:center;gap:7px;padding:6px 13px;border-radius:9px;color:var(--muted);font:700 13px var(--chrome);white-space:nowrap;border:0;background:none;cursor:pointer}
+.tab{display:inline-flex;align-items:center;gap:7px;padding:6px 14px;border-radius:9px;color:var(--muted);font:400 14px var(--font);letter-spacing:.2px;white-space:nowrap;border:0;background:none;cursor:pointer}
 .tab:hover{color:var(--text);text-decoration:none;background:var(--row-hi)}
 .tab[aria-selected=true],.tab[aria-current]{background:var(--hl);color:var(--on-hl);box-shadow:inset 0 1px 0 rgba(255,255,255,.35)}
 .tab .ic{width:17px;height:17px}
@@ -1866,30 +1963,32 @@ fieldset[disabled] .btn,.btn:disabled{opacity:.45;cursor:not-allowed;filter:none
 .tile .ico{display:grid;place-items:center;width:78px;height:78px;border-radius:20px;margin-bottom:4px;transition:background .12s}
 .tile:hover,.tile:focus-visible{border-color:var(--m);outline:none;box-shadow:0 0 0 2px var(--m),0 0 26px -6px rgba(var(--m-rgb),.75)}
 .tile:hover .ico,.tile:focus-visible .ico{background:var(--hl);box-shadow:inset 0 1px 0 rgba(255,255,255,.4),0 6px 16px -8px rgba(var(--m-rgb),.9)}
-.tile .name{font-weight:700;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tile .name{font:300 19px/1.25 var(--display);letter-spacing:.3px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tile .sub{max-width:100%;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow-wrap:anywhere}
 .tile .meter{width:100%;margin-top:6px}
 .tile.off{opacity:.55}
-.sub{font-size:12.5px;color:var(--muted)}
+.sub{font-size:12.5px;font-weight:400;color:var(--muted)}
 .meter{height:10px;border-radius:5px;background:var(--input);border:1px solid var(--line);overflow:hidden}
 .meter i{display:block;height:100%;width:0;background:repeating-linear-gradient(90deg,var(--m) 0 9px,rgba(var(--m-rgb),.55) 9px 11px);box-shadow:0 0 10px rgba(var(--m-rgb),.6);transition:width .2s}
 /* ---- file list ---- */
-.list{overflow:hidden}
+.list{overflow:hidden;padding-bottom:6px}
 .lh,.row{display:grid;grid-template-columns:minmax(0,1fr) 100px 164px 112px;align-items:center;gap:12px;padding:0 14px}
-.lh{height:36px;font:700 12.5px var(--chrome);color:var(--muted);border-bottom:1px solid var(--line);background:linear-gradient(180deg,var(--gloss),transparent)}
+.lh{height:36px;padding:0 20px;margin-bottom:3px;font:500 11.5px var(--font);letter-spacing:1.2px;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--line);background:linear-gradient(180deg,var(--gloss),transparent)}
 .lh a{color:var(--muted)}.lh a.on{color:var(--hot)}
-.row{min-height:46px;border-bottom:1px solid var(--line);position:relative;transition:background-color .08s}
-.row:last-child{border-bottom:0}
-.row:hover,.row:focus-within{background:var(--hl);color:var(--on-hl)}
+.row{min-height:48px;margin:2px 6px 0;border-radius:11px;position:relative;transition:background-color .08s}
+.list>.row:first-child{margin-top:6px}
+.row+.row::before{content:"";position:absolute;left:48px;right:12px;top:-1px;border-top:1px solid var(--line);opacity:.6}
+.row:hover::before,.row:focus-within::before,.row:hover+.row::before,.row:focus-within+.row::before{opacity:0}
+.row:hover,.row:focus-within{background:var(--hl);color:var(--on-hl);box-shadow:inset 0 1px 0 rgba(255,255,255,.28),0 4px 14px -8px rgba(var(--m-rgb),.9)}
 .row:hover .nm,.row:focus-within .nm,.row:hover .num,.row:focus-within .num,.row:hover .mini,.row:focus-within .mini,
 .row:hover .t small,.row:focus-within .t small{color:var(--on-hl)}
 .row:hover .num,.row:focus-within .num,.row:hover .t small,.row:focus-within .t small{opacity:.88}
 .c1{display:flex;align-items:center;gap:8px;min-width:0}
-.nm{flex:1;display:flex;align-items:center;gap:11px;min-width:0;color:var(--text);padding:7px 0;border-radius:6px}
+.nm{flex:1;display:flex;align-items:center;gap:12px;min-width:0;color:var(--text);padding:7px 0;border-radius:6px;font-size:16px;letter-spacing:.15px}
 .nm:hover{text-decoration:none}
 .nm:focus-visible{outline:none}
-.row.dir .n{font-weight:700}
-.num{font-size:13px;color:var(--muted);text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.row.dir .n{font-weight:400}
+.num{font-size:13px;font-weight:400;color:var(--muted);text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .ra{display:flex;justify-content:flex-end;gap:2px}
 .mini{width:32px;height:32px;display:inline-grid;place-items:center;border-radius:50%;color:var(--muted);border:1px solid transparent}
 .mini:hover,.mini:focus-visible{border-color:currentColor;background:rgba(0,0,0,.12);outline:none}
@@ -1905,16 +2004,16 @@ fieldset[disabled] .btn,.btn:disabled{opacity:.45;cursor:not-allowed;filter:none
 .markbar{position:sticky;bottom:calc(var(--sk-h) + env(safe-area-inset-bottom,0px) + 10px);z-index:20;display:none;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px;padding:10px 14px;border-radius:14px;
  background:var(--solid);border:1px solid var(--m);box-shadow:var(--shadow),0 0 22px -6px rgba(var(--m-rgb),.6)}
 .marking .markbar{display:flex}
-.markbar b{font:700 14px var(--chrome)}
+.markbar b{font:400 15px var(--font)}
 .markbar .grow{flex:1}
 /* ---- soft keys ---- */
 .skeys{position:fixed;left:0;right:0;bottom:0;z-index:35;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:8px;height:calc(var(--sk-h) + env(safe-area-inset-bottom,0px));
  padding:0 12px env(safe-area-inset-bottom,0px);background:var(--skeys);border-top:1px solid var(--bar-edge);box-shadow:0 -1px 0 rgba(var(--m-rgb),.55),0 -10px 24px -14px rgba(var(--m-rgb),.5)}
-.sk{justify-self:start;min-width:0;max-width:100%;height:36px;padding:0 14px;border:0;border-radius:10px;background:none;color:var(--skeys-text);font:700 14px var(--chrome);letter-spacing:.3px;cursor:pointer;
+.sk{justify-self:start;min-width:0;max-width:100%;height:36px;padding:0 14px;border:0;border-radius:10px;background:none;color:var(--skeys-text);font:400 15px var(--font);letter-spacing:.5px;cursor:pointer;
  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:inline-flex;align-items:center;gap:6px}
 .sk:hover{background:rgba(var(--m-rgb),.16);text-decoration:none}
 .sk-r{justify-self:end}
-.sk-c{justify-self:center;min-width:110px;justify-content:center;border-radius:18px;background:var(--hl);color:var(--on-hl);box-shadow:inset 0 1px 0 rgba(255,255,255,.45),0 4px 12px -6px rgba(var(--m-rgb),.9)}
+.sk-c{justify-self:center;min-width:110px;justify-content:center;border-radius:18px;background:var(--hl);color:var(--on-hl);font-weight:500;box-shadow:inset 0 1px 0 rgba(255,255,255,.45),0 4px 12px -6px rgba(var(--m-rgb),.9)}
 .sk-c:hover{background:var(--hl);filter:brightness(1.08)}
 .sk[hidden]{display:inline-flex;visibility:hidden}
 .sk kbd{font-size:10.5px;padding:0 5px;opacity:.75}
@@ -1923,7 +2022,7 @@ fieldset[disabled] .btn,.btn:disabled{opacity:.45;cursor:not-allowed;filter:none
  padding:0 0 6px;border-radius:14px;background:var(--solid);border:1px solid var(--line-hi);box-shadow:var(--shadow),0 0 0 1px rgba(var(--m-rgb),.2)}
 .menu[hidden]{display:none}
 .menu .strip{position:sticky;top:0;background:linear-gradient(180deg,var(--gloss),transparent),var(--solid);z-index:1}
-.menu [role=menuitem],.menu [role=menuitemradio]{display:flex;align-items:center;gap:11px;width:calc(100% - 12px);margin:4px 6px 0;padding:9px 12px;border:0;border-radius:9px;background:none;color:var(--text);font:600 14px var(--font);text-align:left;cursor:pointer}
+.menu [role=menuitem],.menu [role=menuitemradio]{display:flex;align-items:center;gap:11px;width:calc(100% - 12px);margin:4px 6px 0;padding:9px 12px;border:0;border-radius:9px;background:none;color:var(--text);font:350 15px var(--font);text-align:left;cursor:pointer}
 .menu [role=menuitem]:hover,.menu [role=menuitem]:focus,.menu [role=menuitemradio]:hover,.menu [role=menuitemradio]:focus{background:var(--hl);color:var(--on-hl);outline:none;text-decoration:none}
 .menu hr{border:0;border-top:1px solid var(--line);margin:6px 10px 0}
 /* ---- dialog ---- */
@@ -1940,15 +2039,16 @@ fieldset[disabled] .btn,.btn:disabled{opacity:.45;cursor:not-allowed;filter:none
 .xsec{padding:12px 16px 14px}
 .xsec+.xsec{border-top:1px solid var(--line)}
 .xsec[hidden]{display:none}
-.xsec h3{display:flex;align-items:center;gap:8px;margin:0 0 2px;font:700 14px var(--chrome)}
+.xsec h3{display:flex;align-items:center;gap:8px;margin:0 0 2px;font:400 15px var(--font)}
 .xsec h3 .ic{width:17px;height:17px;color:var(--hot)}
-.xsec p{margin:0 0 9px;font-size:12.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.xrow{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:9px;font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.xpct{margin-left:auto;font:200 26px/1 var(--display);font-variant-numeric:tabular-nums;letter-spacing:.5px}
+.xsec p{margin:0 0 9px;font-size:12.5px;font-weight:400;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.xrow{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:9px;font-size:12.5px;font-weight:400;color:var(--muted);font-variant-numeric:tabular-nums}
 .xnote{margin-top:8px!important;white-space:normal!important;color:var(--hot)!important}
 .xnote[hidden]{display:none}
 /* ---- toast ---- */
 .toast{position:fixed;left:50%;bottom:calc(var(--sk-h) + env(safe-area-inset-bottom,0px) + 18px);z-index:60;transform:translate(-50%,14px);opacity:0;pointer-events:none;max-width:calc(100vw - 40px);
- display:flex;align-items:center;gap:9px;padding:10px 16px;border-radius:12px;background:#0d0d11;color:#fff;border:1px solid var(--m);box-shadow:0 0 22px rgba(var(--m-rgb),.45);transition:opacity .18s,transform .18s;font-size:14px}
+ display:flex;align-items:center;gap:9px;padding:10px 16px;border-radius:12px;background:#0d0d11;color:#fff;border:1px solid var(--m);box-shadow:0 0 22px rgba(var(--m-rgb),.45);transition:opacity .18s,transform .18s;font-size:14px;font-weight:400}
 .toast.on{opacity:1;transform:translate(-50%,0)}
 .toast.err{border-color:#ff5a5a;box-shadow:0 0 22px rgba(255,80,80,.4)}
 .toast .ic{width:18px;height:18px;color:var(--hot-d)}
@@ -1956,21 +2056,23 @@ fieldset[disabled] .btn,.btn:disabled{opacity:.45;cursor:not-allowed;filter:none
 /* ---- drop target ---- */
 .drop{position:fixed;inset:0;z-index:50;display:none;place-items:center;background:var(--scrim)}
 .drop.on{display:grid}
-.drop>div{padding:34px 52px;border:2px dashed var(--m);border-radius:20px;background:var(--solid);text-align:center;font-size:18px;box-shadow:0 0 50px rgba(var(--m-rgb),.45)}
+.drop>div{padding:34px 52px;border:2px dashed var(--m);border-radius:20px;background:var(--solid);text-align:center;font:200 26px/1.3 var(--display);box-shadow:0 0 50px rgba(var(--m-rgb),.45)}
 .drop p{margin:12px 0 0}
+.drop p b{font-weight:300;color:var(--hot)}
 .drop .ic{width:44px;height:44px;color:var(--hot)}
 /* ---- settings ---- */
 .sgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,440px),1fr));gap:16px;align-items:start}
 .pane[hidden]{display:none}
 .sect{padding:20px 22px}
-.sect h2{font-size:17px;font-weight:600;margin:0 0 4px;display:flex;align-items:center;gap:10px}
+.sect h2{font:300 21px/1.3 var(--display);letter-spacing:.3px;margin:0 0 6px;display:flex;align-items:center;gap:10px}
 .sect h2::before{content:"";width:9px;height:9px;border-radius:50%;background:var(--m);box-shadow:0 0 9px var(--m)}
-.note{margin:0 0 14px;color:var(--muted);font-size:13.5px}
+.note{margin:0 0 14px;color:var(--muted);font-size:13.5px;font-weight:400}
+.note.tip{padding:11px 14px;border-radius:11px;border:1px solid rgba(var(--m-rgb),.5);background:rgba(var(--m-rgb),.08);color:var(--text)}
 fieldset{border:0;margin:0;padding:0;min-width:0}
 .check{display:flex;align-items:center;gap:14px;padding:11px 0;border-bottom:1px solid var(--line);cursor:pointer}
 .check:last-of-type{border-bottom:0}
 .grow{flex:1;min-width:0}
-.check b{font-weight:600}
+.check b{font-weight:400;font-size:15px}
 .check small{display:block;color:var(--muted);font-size:12.5px;overflow-wrap:anywhere}
 .sw{appearance:none;-webkit-appearance:none;width:46px;height:26px;margin:0;border-radius:13px;background:var(--input);border:1px solid var(--line-hi);position:relative;cursor:pointer;flex:none;box-shadow:inset 0 2px 4px rgba(0,0,0,.35);transition:background .15s}
 .sw::after{content:"";position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;background:linear-gradient(180deg,#fff,#c9ccd4);box-shadow:0 1px 3px rgba(0,0,0,.5);transition:left .15s}
@@ -1984,14 +2086,14 @@ fieldset{border:0;margin:0;padding:0;min-width:0}
 .seg{display:inline-flex;border:1px solid var(--line-hi);border-radius:20px;overflow:hidden;background:var(--solid)}
 .seg label{position:relative;cursor:pointer}
 .seg input{position:absolute;opacity:0;pointer-events:none}
-.seg span{display:block;padding:8px 16px;font:700 13.5px var(--chrome);border-right:1px solid var(--line)}
+.seg span{display:block;padding:8px 16px;font:400 14px var(--font);border-right:1px solid var(--line)}
 .seg label:last-child span{border-right:0}
 .seg input:checked+span{color:var(--on-hl);background:var(--hl)}
 .seg input:focus-visible+span{outline:2px solid var(--hot);outline-offset:-3px}
 .swatches{display:flex;gap:12px;flex-wrap:wrap}
 .swatch{position:relative;cursor:pointer}
 .swatch input{position:absolute;opacity:0;pointer-events:none}
-.swatch span{display:grid;place-items:center;gap:4px;font:700 12px var(--chrome);color:var(--muted)}
+.swatch span{display:grid;place-items:center;gap:4px;font:400 12.5px var(--font);color:var(--muted)}
 .swatch i{display:block;width:40px;height:40px;border-radius:50%;border:2px solid var(--line-hi);box-shadow:inset 0 -6px 10px rgba(0,0,0,.35),inset 0 6px 8px rgba(255,255,255,.35)}
 .swatch input:checked+span{color:var(--text)}
 .swatch input:checked+span i{border-color:var(--text);box-shadow:0 0 0 3px var(--solid),0 0 0 5px var(--text),inset 0 -6px 10px rgba(0,0,0,.35)}
@@ -1999,17 +2101,18 @@ fieldset{border:0;margin:0;padding:0;min-width:0}
 .kv{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:11px 14px;border-radius:11px;background:var(--input);border:1px solid var(--line)}
 .flash{padding:11px 16px;border-radius:12px;margin-bottom:16px;border:1px solid var(--m);background:rgba(var(--m-rgb),.12)}
 .flash.err{border-color:#ff5a5a;background:rgba(255,90,90,.12)}
-.badge{font:700 11px var(--chrome);padding:2px 8px;border-radius:9px;border:1px solid var(--line-hi);color:var(--muted);white-space:nowrap}
+.badge{font:500 11px var(--font);letter-spacing:.3px;padding:2px 8px;border-radius:9px;border:1px solid var(--line-hi);color:var(--muted);white-space:nowrap}
 .badge.on{border-color:var(--m);color:var(--hot)}
-.ifaces{width:100%;border-collapse:collapse;font-size:13px;margin:4px 0 12px}
-.ifaces th{text-align:left;font:700 12px var(--chrome);color:var(--muted);padding:6px 8px;border-bottom:1px solid var(--line)}
+.ifaces{width:100%;border-collapse:collapse;font-size:13px;font-weight:400;margin:4px 0 12px}
+.ifaces th{text-align:left;font:500 11px var(--font);letter-spacing:1px;text-transform:uppercase;color:var(--muted);padding:6px 8px;border-bottom:1px solid var(--line)}
 .ifaces td{padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere}
-.steps{margin:0 0 12px;padding-left:20px;color:var(--muted);font-size:13.5px}
+.steps{margin:0 0 12px;padding-left:20px;color:var(--muted);font-size:13.5px;font-weight:400}
 .steps li{margin:4px 0}
 .speed{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:10px;margin:4px 0 14px}
 .gauge{padding:12px;border-radius:12px;background:var(--input);border:1px solid var(--line);text-align:center}
-.gauge b{display:block;font:300 22px/1.25 var(--font);font-variant-numeric:tabular-nums;white-space:nowrap}
-.gauge small{display:block;font:700 11.5px var(--chrome);color:var(--muted);margin-top:2px}
+.gauge b{display:block;font:200 32px/1.15 var(--display);letter-spacing:.3px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gauge b .u{margin-left:3px;font:400 12px var(--font);letter-spacing:.3px;color:var(--muted)}
+.gauge small{display:block;font:400 12px var(--font);letter-spacing:.3px;color:var(--muted);margin-top:3px}
 .gauge .meter{margin-top:8px;height:8px}
 .login{max-width:400px;margin:48px auto;padding:30px 28px;text-align:center}
 .lockic{width:64px;height:64px;color:var(--hot);margin-bottom:6px}
@@ -2021,12 +2124,20 @@ fieldset{border:0;margin:0;padding:0;min-width:0}
  .tools{margin-left:auto}
  .wrap{padding:16px 12px 30px}
  .lh,.row{grid-template-columns:minmax(0,1fr) 78px;padding:0 10px;gap:8px}
+ .lh{padding:0 14px}
+ .row{margin:2px 4px 0}
+ .row+.row::before{left:42px}
+ .nm{font-size:15.5px}
  .c-size,.c-date{display:none}
- .title{font-size:24px}
+ .title{font-size:29px}
+ .head{align-items:flex-start}
+ .standby{order:-1;flex-basis:100%;text-align:left}
+ .standby b{font-size:56px}
+ .standby small{font-size:15px}
  .menu-grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;padding:10px}
  .tile{padding:14px 10px 12px}
  .tile .ico{width:64px;height:64px}
- .sk{padding:0 8px;font-size:13px}
+ .sk{padding:0 8px;font-size:14px}
  .sk-c{min-width:92px}
  .sk kbd{display:none}
  .actions .btn.ghost{display:none}
@@ -2034,13 +2145,16 @@ fieldset{border:0;margin:0;padding:0;min-width:0}
 }
 @media (pointer:coarse){.kb{display:none}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+@media (prefers-reduced-transparency:reduce){body::before{display:none}}
 @media (forced-colors:active){
+ body::before{display:none}
+ .standby b{color:CanvasText;background:none}
  .row:hover,.row:focus-within,.live a:hover,.live a[aria-selected=true],.tab[aria-selected=true],.tab[aria-current],
  .menu [role=menuitem]:focus,.menu [role=menuitem]:hover{background:Highlight;color:HighlightText;forced-color-adjust:none}
  .btn,.sk-c{border:1px solid ButtonText}
  .meter i{background:Highlight}
 }
-""".replace("/*LIGHT*/", LIGHT_VARS)
+""".replace("/*LIGHT*/", LIGHT_VARS).replace("/*RIBBONS*/", RIBBONS)
 
 _GRADIENTS = (
     '<linearGradient id="gFold" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffe27a"/>'
@@ -2223,10 +2337,12 @@ const focusSearch = () => { if (q) { q.focus(); q.select(); } else location.href
 
 /* ---- status bar: signal (really the round trip to Beam), clock, battery, indexing ---- */
 const sig = $("#sig"), clock = $("#clock"), bat = $("#bat"), sbIdx = $("#sbIdx"), idxText = $("#idx");
+const bigClock = $("#bigClock"), bigDate = $("#bigDate");
 function tick() {
-  if (!clock) return;
-  const d = new Date();
-  clock.textContent = String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  if (!clock && !bigClock) return;
+  const d = new Date(), hm = String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  if (clock) clock.textContent = hm;
+  if (bigClock) { bigClock.textContent = hm; bigDate.textContent = d.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" }).replace(",", ""); }
   setTimeout(tick, 60050 - Date.now() % 60000);
 }
 tick();
@@ -2452,6 +2568,7 @@ const X = {
     $("#x" + k + "N").textContent = o.name || "";
     const pct = o.total ? Math.min(100, o.done / o.total * 100) : (o.finished ? 100 : 0);
     $("#x" + k + "B").style.width = pct.toFixed(1) + "%";
+    $("#x" + k + "P").textContent = o.total || o.finished ? Math.floor(pct) + "%" : "";
     $("#x" + k + "S").textContent = o.stats;
   }
 };
@@ -2494,7 +2611,7 @@ if (upBase) {
     }
     const names = Array.from(up.active, x => x.item.path);
     const pending = up.queue.length + up.active.size;
-    let s = Math.floor(up.bytesTotal ? up.bytesDone / up.bytesTotal * 100 : 100) + "% · " + fmt(up.bytesDone) + " of " + fmt(up.bytesTotal);
+    let s = fmt(up.bytesDone) + " of " + fmt(up.bytesTotal);
     if (up.rate > 0) s += " · " + fmt(up.rate) + "/s · " + left((up.bytesTotal - up.bytesDone) / up.rate);
     X.paint("up", { title: "Sending " + pending + " file" + (pending === 1 ? "" : "s") + " to " + (D.folder || "Beam"), name: names.join(", "), done: up.bytesDone, total: up.bytesTotal, stats: s });
   }
@@ -2636,8 +2753,14 @@ document.addEventListener("click", e => {
 });
 $$("[data-act]").forEach(b => { if (!b.closest("#menu") && b !== skC) b.addEventListener("click", e => { e.preventDefault(); act(b.dataset.act); }); });
 
+// Chrome, Edge and the other Blink browsers silently drop page-started
+// downloads beyond 10 a second per frame, which a queue of small files hits
+// at once. So there Beam clicks its download links inside a few hidden
+// frames, each with its own allowance. A clicked link belongs to the browser
+// straight away, so browsing on doesn't cancel it (a frame navigation would).
+const BLINK = /Chrome\/\d/.test(navigator.userAgent);  // also HeadlessChrome; not iOS (CriOS is WebKit)
 const dq = {
-  max: 4, batch: "", n: 0, items: [], timer: 0, lastT: 0, lastB: 0, rate: 0, started: 0,
+  max: 4, batch: "", n: 0, items: [], timer: 0, gateT: 0, lastT: 0, lastB: 0, rate: 0, started: 0, v: 0, ctl: null, pads: [],
   busy() { return this.items.some(it => it.st === "q" || it.st === "t" || it.st === "r"); },
   save() { if (this.items.length) store.set("beam_dq", JSON.stringify({ batch: this.batch, n: this.n, items: this.items, started: this.started })); else store.del("beam_dq"); },
   load() {
@@ -2645,12 +2768,39 @@ const dq = {
     if (this.items.length) { X.show("down"); this.poll(); }
   },
   add(list) {
-    if (!this.busy()) { this.batch = rid(); this.n = 0; this.items = []; this.started = Date.now(); this.rate = 0; this.lastT = 0; }
+    if (!this.busy()) {
+      this.batch = rid(); this.n = 0; this.items = []; this.started = Date.now(); this.rate = 0; this.lastT = 0; this.v = 0;
+      if (this.ctl) this.ctl.abort();  // a check on the previous batch is still waiting: drop it
+    }
     for (const x of list) this.items.push({ id: this.n++, url: x.url, name: x.name, size: x.size, post: x.post || null, st: "q", sent: 0, conns: 0 });
     this.save(); X.show("down"); this.pump(); this.paint(); this.poll();
   },
   active() { const now = Date.now(); return this.items.reduce((n, it) => n + (it.st === "r" ? Math.max(1, it.conns) : it.st === "t" && now - it.t < 20000 ? 1 : 0), 0); },
-  trigger(it) {
+  pad() {
+    // Somewhere a download link can be clicked now without going over the
+    // limit (at most 9 in any 1.1 s each): { p } or { wait: ms }.
+    const now = Date.now();
+    let wait = 1100;
+    for (const p of this.pads) {
+      p.log = p.log.filter(t => now - t < 1100);
+      if (p.log.length < 9) return { p };
+      wait = Math.min(wait, p.log[0] + 1100 - now);
+    }
+    if (!this.pads.length || (BLINK && this.pads.length < 6)) {
+      let doc = document;
+      if (BLINK) {
+        const f = document.createElement("iframe");
+        f.hidden = true; f.tabIndex = -1; f.title = "Downloads"; f.setAttribute("aria-hidden", "true");
+        body.appendChild(f);
+        if (f.contentDocument && f.contentDocument.body) doc = f.contentDocument; else f.remove();
+      }
+      const p = { doc, log: [] };
+      this.pads.push(p);
+      return { p };
+    }
+    return { wait };
+  },
+  trigger(it, pad) {
     const url = it.url + (it.url.indexOf("?") < 0 ? "?" : "&") + "tx=" + this.batch + "." + it.id;
     if (it.post) {
       const f = document.createElement("form");
@@ -2658,39 +2808,61 @@ const dq = {
       for (const [k, v] of it.post) { const i = document.createElement("input"); i.type = "hidden"; i.name = k; i.value = v; f.appendChild(i); }
       body.appendChild(f); f.submit(); setTimeout(() => f.remove(), 1000);
     } else {
-      const a = document.createElement("a");
-      a.href = url; a.download = it.name || ""; a.hidden = true;
-      body.appendChild(a); a.click(); a.remove();
+      const a = pad.doc.createElement("a");
+      a.href = new URL(url, location.href).href; a.download = it.name || ""; a.hidden = true;
+      pad.doc.body.appendChild(a); a.click(); a.remove();
+      pad.log.push(Date.now());
     }
-    it.st = "t"; it.t = Date.now();
+    it.st = "t"; it.t = Date.now(); it.tries = (it.tries || 0) + 1;
   },
   pump() {
     let busy = this.active();
     for (const it of this.items) {
       if (busy >= this.max) break;
-      if (it.st === "q") { this.trigger(it); busy++; }
+      if (it.st !== "q") continue;
+      let pad = null;
+      if (!it.post) {
+        const r = this.pad();
+        if (!r.p) { clearTimeout(this.gateT); this.gateT = setTimeout(() => this.pump(), r.wait + 20); break; }
+        pad = r.p;
+      }
+      this.trigger(it, pad); busy++;
     }
     this.save();
   },
   async poll() {
+    // One check at a time. Beam holds each reply until a download starts or
+    // finishes (or 0.7 s passes), so a free slot is refilled at once.
     clearTimeout(this.timer);
-    if (!this.items.length) return;
+    if (this.ctl || !this.items.length) return;
+    const b = this.batch, ctl = this.ctl = new AbortController();
+    let pause = 0;
     try {
-      const r = await fetch("/api/transfers?b=" + this.batch, { cache: "no-store" });
-      if (r.ok) {
-        const snap = (await r.json()).items || {};
+      const r = await fetch("/api/transfers?wait=1&b=" + b + "&v=" + this.v, { cache: "no-store", signal: ctl.signal });
+      if (!r.ok) throw new Error("status " + r.status);
+      const j = await r.json();
+      if (b === this.batch) {
+        const snap = j.items || {}, now = Date.now();
+        this.v = j.v || 0;
         for (const it of this.items) {
           const s = snap[it.id];
           if (!s) continue;
-          it.conns = s[0]; it.sent = s[1]; it.size = s[2];
+          it.seen = true; it.conns = s[0]; it.sent = s[1]; it.size = s[2];
           if (it.st === "t" || it.st === "r") it.st = s[3] === 0 ? "r" : s[3] === 1 ? "d" : "f";
         }
-        for (const it of this.items) if (it.st === "t" && Date.now() - it.t > 60000) it.st = "f"; // the browser never started it
+        for (const it of this.items) {
+          if (it.st !== "t") continue;
+          // Downloads asked for after this one have reached Beam but this one
+          // hasn't: the browser dropped it, so ask once more.
+          if (now - it.t > 3000 && (it.tries || 0) < 2 && this.items.some(o => o.seen && o.t > it.t)) it.st = "q";
+          else if (now - it.t > 60000) it.st = "f";  // the browser never started it
+        }
       }
-    } catch (_) {}
+    } catch (_) { if (!ctl.signal.aborted) pause = 1500; } // Beam unreachable for a moment: don't hammer it
+    this.ctl = null;
     this.pump(); this.paint();
-    if (this.busy()) this.timer = setTimeout(() => this.poll(), 700);
-    else this.finish();
+    if (this.busy()) this.timer = setTimeout(() => this.poll(), pause);
+    else if (this.items.length) this.finish();
   },
   paint() {
     const n = this.items.length, done = this.items.filter(it => it.st === "d").length;
@@ -2825,18 +2997,25 @@ async function runSpeed() {
   if (!spBtn || spBtn.disabled) return;
   spBtn.disabled = true;
   const note = $("#spNote");
-  const gauge = (k, v, frac) => { const g = $("#sp" + k); if (!g) return; $("b", g).textContent = v; const m = $(".meter i", g); if (m) m.style.width = Math.max(0, Math.min(100, frac * 100)).toFixed(0) + "%"; };
-  ["Ping", "One", "Many", "Up"].forEach(k => gauge(k, "…", 0));
+  const gauge = (k, v, unit, frac) => {  // a big thin number with its unit small beside it, like a phone readout
+    const g = $("#sp" + k); if (!g) return;
+    const b = $("b", g); b.textContent = v;
+    if (unit) { const u = document.createElement("span"); u.className = "u"; u.textContent = unit; b.appendChild(u); }
+    const m = $(".meter i", g); if (m) m.style.width = Math.max(0, Math.min(100, frac * 100)).toFixed(0) + "%";
+  };
+  ["Ping", "One", "Many", "Up"].forEach(k => gauge(k, "…", "", 0));
   note.textContent = "Testing… keep this page open for about 15 seconds.";
   try {
     const p = await rttOf("/api/ping");
     if (p == null) throw new Error("Beam isn't answering");
-    gauge("Ping", (p < 10 ? p.toFixed(1) : Math.round(p)) + NB + "ms", Math.max(0.05, 1 - p / 60));
-    const one = await dlTest(1, 4000); gauge("One", mbs(one) + NB + "MB/s", one / 125e6);
-    const many = await dlTest(4, 4000); gauge("Many", mbs(many) + NB + "MB/s", many / 125e6);
-    const upl = await ulTest(); gauge("Up", mbs(upl) + NB + "MB/s", upl / 125e6);
+    gauge("Ping", String(p < 10 ? p.toFixed(1) : Math.round(p)), "ms", Math.max(0.05, 1 - p / 60));
+    const one = await dlTest(1, 4000); gauge("One", String(mbs(one)), "MB/s", one / 125e6);
+    const many = await dlTest(4, 4000); gauge("Many", String(mbs(many)), "MB/s", many / 125e6);
+    const upl = await ulTest(); gauge("Up", String(mbs(upl)), "MB/s", upl / 125e6);
     let t = "Downloads from " + (D.host || "the Beam PC") + " can reach about " + mbs(Math.max(one, many)) + " MB/s over this connection.";
     if (many > one * 1.2) t += " Several at once are clearly faster here, so use Mark several for batches.";
+    const sp = $("#speed");
+    if (sp && sp.dataset.hostwifi === "1") t += " " + (D.host || "The Beam PC") + " is itself on Wi-Fi, so data crosses the air twice: a cable from it to your router can nearly double this.";
     t += " For comparison: wired gigabit manages about 110 MB/s, Wi-Fi 6 roughly 40–90, older Wi-Fi 5–30. If a real download is slower than this, the drive is the limit (USB 2.0 drives top out near 35 MB/s).";
     note.textContent = t;
   } catch (e) {
@@ -2940,11 +3119,11 @@ BASE_HTML = """<!DOCTYPE html>
 %%SOFTKEYS%%
 <div id="drop" class="drop" aria-hidden="true"><div><svg class="ic"><use href="#i-upload"/></svg><p>Drop to send to <b id="dropName"></b></p></div></div>
 <section id="xfer" class="panel xfer" aria-live="polite" aria-label="Transfers" hidden>
-<div class="xsec" id="xdown" hidden><h3><svg class="ic" aria-hidden="true"><use href="#i-download"/></svg><span id="xdownT">Receiving</span></h3>
+<div class="xsec" id="xdown" hidden><h3><svg class="ic" aria-hidden="true"><use href="#i-download"/></svg><span id="xdownT">Receiving</span><b class="xpct" id="xdownP"></b></h3>
 <p id="xdownN"></p><div class="meter"><i id="xdownB"></i></div>
 <div class="xrow"><span id="xdownS"></span><button type="button" class="btn ghost sm" id="xdownStop">Stop queue</button></div>
 <p class="xnote" id="xdownNote" hidden>Waiting for your browser. If it asks whether Beam may download multiple files, choose Allow.</p></div>
-<div class="xsec" id="xup" hidden><h3><svg class="ic" aria-hidden="true"><use href="#i-upload"/></svg><span id="xupT">Sending</span></h3>
+<div class="xsec" id="xup" hidden><h3><svg class="ic" aria-hidden="true"><use href="#i-upload"/></svg><span id="xupT">Sending</span><b class="xpct" id="xupP"></b></h3>
 <p id="xupN"></p><div class="meter"><i id="xupB"></i></div>
 <div class="xrow"><span id="xupS"></span><button type="button" class="btn ghost sm" id="xupStop">Cancel</button></div></div>
 </section>
@@ -3259,8 +3438,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if sub == "status":
                     return self.send_json(index.status())
                 if sub == "transfers":
-                    b = self.q("b")
-                    return self.send_json({"items": transfers.snapshot(b) if re.fullmatch(r"[A-Za-z0-9]{8,32}", b) else {}})
+                    return self.api_transfers()
                 if sub == "paths":
                     return self.api_paths()
                 if sub == "handoff":
@@ -3493,9 +3671,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                      f'<span class="name">Settings</span><span class="sub">Drives, password, speed test</span></a>')
         st = index.status()
         idx = (f"Indexing… {st['count']:,} items so far" if st["state"] == "building" else f"{st['count']:,} items indexed")
+        now = time.localtime()
         body = ('<div class="head"><div><h1 class="title">Your drives</h1>'
                 f'<div class="meta"><span id="idx">{esc(idx)}</span><span class="kb"> · <kbd>/</kbd> search · arrow keys move · '
-                '<kbd>Enter</kbd> opens</span></div></div></div>'
+                '<kbd>Enter</kbd> opens</span></div></div>'
+                f'<div class="standby" aria-hidden="true"><b id="bigClock">{time.strftime("%H:%M", now)}</b>'
+                f'<small id="bigDate">{time.strftime("%A ", now)}{now.tm_mday}{time.strftime(" %B", now)}</small></div></div>'
                 f'<section class="panel" aria-label="Main menu"><div class="strip"><span>Main menu</span><span class="grow"></span>'
                 f'<span id="cap" aria-hidden="true"></span></div><div class="menu-grid">{"".join(tiles)}</div></section>')
         self.send_html(200, self.page("Your drives", body, keys=keys, kind="home"))
@@ -3674,6 +3855,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     "direct": bool(cur and is_direct_link(cur))},
                         "others": others[:6], "port": self.server.server_port, "ready": netinfo.refreshed_once()})
 
+    def api_transfers(self):
+        """Progress of the page's download queue. With v (the last version the
+        page saw) and wait=1, holds the reply until a download starts or ends,
+        or TX_WATCH seconds pass (so progress bars still move)."""
+        b = self.q("b")
+        if not re.fullmatch(r"[A-Za-z0-9]{8,32}", b):
+            return self.send_json({"v": 0, "items": {}})
+        since = self.q("v")
+        since = int(since) if re.fullmatch(r"[0-9]{1,9}", since) else None
+        v, items = transfers.watch(b, since, TX_WATCH if self.q("wait") == "1" else 0)
+        self.send_json({"v": v, "items": items})
+
     # ---- files ---------------------------------------------------------------
     def _file_target(self, sid, rel):
         share = find_share(sid)
@@ -3683,14 +3876,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def download(self, sid, rel):
         _share, target = self._file_target(sid, rel)
         if target is None or not target.is_file():
+            transfers.fail(self.q("tx"))
             return self.error_page(404, "File not found", "It may have been moved, renamed or deleted.")
         view = self.q("view") == "1"
         try:
             fh = open_for_reading(target)
             st = os.fstat(fh.fileno())
         except PermissionError:
+            transfers.fail(self.q("tx"))
             return self.error_page(403, "Access denied", "Windows won't let Beam read this file (it may be in use).")
         except OSError:
+            transfers.fail(self.q("tx"))
             return self.error_page(404, "File not found", "It may have been moved, renamed or deleted.")
         with fh:
             size = st.st_size
@@ -3731,8 +3927,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             tune_bulk(self.connection)
             tx = transfers.begin(self.q("tx"), size)
             t0, sent = time.perf_counter(), 0
+
+            def progress(n):
+                if tx:
+                    tx.add(n)
+                stay_awake()
             try:
-                sent = send_file(self.connection, fh, start, length, tx.add if tx else None)
+                sent = send_file(self.connection, fh, start, length, progress)
             finally:
                 if tx:
                     tx.end(sent == length)
@@ -3745,6 +3946,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def zip_folder(self, sid, rel, pick=None):
         share, target = self._file_target(sid, rel)
         if target is None or not target.is_dir():
+            transfers.fail(self.q("tx"))
             return self.error_page(404, "Folder not found", "It may have been moved, renamed or deleted.")
         name = clean_component(target.name or share["name"]) or "Beam"
         zs = ZipStream(zip_plan(str(target), name, settings.get("show_hidden"), pick))
@@ -3755,8 +3957,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         tx = transfers.begin(self.q("tx"), zs.size)
         log.info("ZIP download: %s (%s files, %s) to %s", target, f"{len(zs.items):,}", human_size(zs.size), self.client_ip())
         t0, sent = time.perf_counter(), 0
+
+        def progress(n):
+            if tx:
+                tx.add(n)
+            stay_awake()
         try:
-            sent = zs.stream(self.connection.sendall, tx.add if tx else None)
+            sent = zs.stream(self.connection.sendall, progress)
         finally:
             if tx:
                 tx.end(sent == zs.size)
@@ -3765,9 +3972,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def zip_marked(self, sid, rel):
         form = self.read_form(MAX_PICK_BYTES)
         if form is None:
+            transfers.fail(self.q("tx"))
             return self.error_page(413, "Too many items", "That's more marked items than Beam can put in one ZIP request.")
         pick = {p for p in form.get("pick", []) if p and "/" not in p and "\\" not in p and p not in (".", "..")}
         if not pick:
+            transfers.fail(self.q("tx"))
             return self.error_page(400, "Nothing marked", "Mark some files or folders first.")
         return self.zip_folder(sid, rel, pick)
 
@@ -3812,6 +4021,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     chunk = buf[:n]
                     while chunk:
                         chunk = chunk[out.write(chunk):]
+                    stay_awake()
             if received != length:
                 raise ConnectionError("upload interrupted")
             final = place_upload(tmp, parent, comps[-1])
@@ -3991,6 +4201,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                    f"({esc(cur['name'] or here)}, {esc(here)}).")
         else:
             how = f"This device reaches Beam at {esc(here or 'this PC')}."
+        host_wifi = bool(cur and cur["kind"] == "wifi" and not is_direct_link(cur))
+        if host_wifi:
+            rate = f" (its link is running at {esc(link_speed(cur['speed']))})" if cur.get("speed") else ""
+            how += (f"</p><p class=\"note tip\"><b>Faster Wi-Fi tip:</b> this PC is on Wi-Fi{rate}, so every download "
+                    "crosses the air twice: PC to router, then router to your device. Plugging this PC into the router "
+                    "with a network cable can nearly double Wi-Fi download speeds, with your other devices staying on Wi-Fi.")
         iface_rows = ""
         warn = ""
         for iface in ifaces:
@@ -4059,7 +4275,7 @@ set a DHCP reservation for this PC in your router so the backup address never ch
 <form method="post" action="/settings"><fieldset{dis}><input type="hidden" name="action" value="port">
 <div class="field"><label for="port">Port</label><input id="port" type="number" name="port" min="1024" max="65535" value="{port_saved}">
 <button class="btn ghost">Save port</button></div></fieldset></form></section>''',
-                f'''<section class="panel sect" id="speed"><h2>Speed test</h2>
+                f'''<section class="panel sect" id="speed"{' data-hostwifi="1"' if host_wifi else ''}><h2>Speed test</h2>
 <p class="note">Measures the network between this device and {esc(HOSTNAME.upper())}. Nothing is read from or written to your drives.</p>
 <div class="speed">
 <div class="gauge" id="spPing"><b>–</b><small>Ping</small><div class="meter"><i></i></div></div>

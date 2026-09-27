@@ -11,13 +11,13 @@ Beam is one Python file. Run it on the PC with the drives, bookmark the address 
 ## What it does
 
 - **Finds your drives itself.** USB and internal drives are detected automatically. Tick the ones to share, and nothing else on the PC is reachable.
-- **Fast over Wi-Fi.** Downloads stream from the drive in large chunks with little overhead (zero-copy on Mac and Linux), and on Windows big transfers get the larger send buffer Wi-Fi needs. **Mark several** files (or a whole season) and Beam downloads four at a time, which fills a Wi-Fi link far better than one after another, while the page stays quick to use.
+- **Fast over Wi-Fi.** Downloads stream from the drive in large chunks with little overhead (zero-copy on Mac and Linux), and on Windows big transfers get the larger send buffer Wi-Fi needs. **Mark several** files (or a whole season) and Beam downloads four at a time, which fills a Wi-Fi link far better than one after another, while the page stays quick to use. The next file starts the instant one finishes, and Beam works around Chrome's limit of ten page-started downloads a second, so a batch of photos goes as fast as the network allows. While files are moving, the Beam PC won't doze off halfway through.
 - **Even faster over a cable.** Join the two PCs with a network cable and Beam notices the wired route, offers to switch to it, and walks you through the one Windows setting a direct cable needs.
 - **Search that forgives typos.** Search every drive at once as you type. "inseption", "braking bad pilot" and "peeky blindrs s04" all find the right thing, in milliseconds even across hundreds of thousands of files, and a season's episodes come back in order.
 - **Drag and drop both ways.** Drop files or whole folders onto the page to upload them, three at a time. In Chrome or Edge you can drag a file *out* of the page straight onto your desktop.
 - **Downloads that resume** if the connection drops, **ZIP a folder or just the marked items** with a proper progress bar and time left, and preview videos, music, images and PDFs in the browser.
 - **A built-in speed test** shows what your network can really do, one download at a time and four at once.
-- **Looks and works like a 2000s phone menu.** Signal bars (which really measure the connection), a clock, soft keys along the bottom (Options, Select, Back), a glossy highlight bar you steer with the arrow keys, and five colour themes in dark or light.
+- **Looks and works like a 2000s phone menu.** Thin, light lettering (each device's own: Segoe UI Light on Windows, Roboto Thin on Android, SF on Apple), a big thin standby clock, flowing light ribbons in the wallpaper, signal bars (which really measure the connection), soft keys along the bottom (Options, Select, Back), a glossy highlight bar you steer with the arrow keys, and five colour themes in dark or light.
 - **A bookmark that keeps working.** The address uses the PC's name rather than its IP, so it survives the router handing out new addresses.
 - **Never deletes or overwrites anything.** An upload that clashes with an existing name is saved as `name (1).ext`.
 - **Optional password**, start-with-Windows, and a stop button, all in Settings.
@@ -38,6 +38,8 @@ To have Beam running whenever the PC is on, switch on **Start with Windows** in 
 **Several files:** open the folder, choose **Mark several** (or Options > Mark several), tick what you want (Shift-click ticks a run), then **Download**. Beam keeps four downloads going at once and shows their combined speed and time left. The first time, your browser may ask whether Beam may download multiple files: choose **Allow**. **As one ZIP** puts the marked items in a single download instead.
 
 **Every file in a folder:** Options > **Download all files** does the same for everything in the folder.
+
+**Is the Beam PC itself on Wi-Fi?** Then every download crosses the air twice: PC to router, then router to your device. Plugging the Beam PC into the router with a network cable can nearly double Wi-Fi download speeds, with everything else staying on Wi-Fi. Settings > Connection shows a tip when this applies.
 
 **Over a cable (the megarapid option):** Wi-Fi is fine for everyday use, but a cable is several times faster and much steadier.
 
@@ -112,7 +114,7 @@ Found a problem? See [SECURITY.md](SECURITY.md).
 
 **The other PC can't connect.** Check both PCs are on the same network. On the Beam PC, go to Settings → Network & Internet and make sure the network is set to **Private**, not Public. If you clicked Cancel on the firewall prompt, open *Windows Security → Firewall & network protection → Allow an app through firewall* and tick **Python** under Private.
 
-**Downloads are slow.** Run the speed test in Settings > Connection. If the test is slow too, it's the network: move closer to the router, use the 5 GHz band, or use a cable. If the test is fast but files are slow, it's the drive (older USB drives and USB 2.0 ports are the usual culprits). For lots of files, use Mark several so four run at once.
+**Downloads are slow.** Run the speed test in Settings > Connection. If the test is slow too, it's the network: move closer to the router, use the 5 GHz band, plug the Beam PC into the router with a cable if it's on Wi-Fi, or use a cable between the PCs. If the test is fast but files are slow, it's the drive (older USB drives and USB 2.0 ports are the usual culprits). For lots of files, use Mark several so four run at once.
 
 **The cable doesn't work, or Beam doesn't offer it.** Give Windows a minute after plugging in. Then check Settings > Connection on the Beam PC: if the cable network is marked Public, make it Private there. Some PCs need the cable connection's IP settings left on "Automatic (DHCP)" for the automatic 169.254 address to appear.
 

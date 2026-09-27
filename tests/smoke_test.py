@@ -156,9 +156,21 @@ def main():
         big = "/dl/%s/Films/Big.bin" % sid
         st, h, body = req("GET", big + "?tx=abcdefgh12.0")
         check("large download intact", body == (share / "Films" / "Big.bin").read_bytes())
-        snap = json.loads(req("GET", "/api/transfers?b=abcdefgh12")[2])["items"]
+        tr = json.loads(req("GET", "/api/transfers?b=abcdefgh12")[2])
+        snap = tr["items"]
         check("download progress tracked for the queue", snap.get("0", [0, 0, 0, 0])[1:] == [len(body), len(body), 1], snap)
-        check("bad transfer id ignored", json.loads(req("GET", "/api/transfers?b=../../x")[2]) == {"items": {}})
+        check("bad transfer id ignored", json.loads(req("GET", "/api/transfers?b=../../x")[2]) == {"v": 0, "items": {}})
+        t0 = time.perf_counter()
+        quick = json.loads(req("GET", "/api/transfers?wait=1&b=abcdefgh12&v=0")[2])
+        check("queue check answers at once when something changed", quick["v"] == tr["v"] and time.perf_counter() - t0 < 0.5)
+        t0 = time.perf_counter()
+        held = json.loads(req("GET", f"/api/transfers?wait=1&b=abcdefgh12&v={tr['v']}")[2])
+        waited = time.perf_counter() - t0
+        check("queue check waits for news (briefly)", held["v"] == tr["v"] and 0.5 < waited < 3, f"{waited:.2f}s")
+        st = req("GET", f"/dl/{sid}/Films/No%20such%20file.bin?tx=abcdefgh12.1")[0]
+        snap = json.loads(req("GET", "/api/transfers?b=abcdefgh12")[2])["items"]
+        check("missing file reported to the queue at once", st == 404 and snap.get("1", [0, 0, 0, 0])[3] == 2, snap)
+        check("junk version ignored", req("GET", "/api/transfers?wait=1&b=abcdefgh12&v=%C2%B2")[0] == 200)
 
         # ---- uploads
         up = f"/api/upload/{sid}/Films?path=" + urllib.parse.quote("New Folder/note.txt")
