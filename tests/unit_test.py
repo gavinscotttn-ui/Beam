@@ -288,6 +288,9 @@ def test_netinfo():
     check("single-item PowerShell output parsed", [x["name"] for x in beam.parse_win_netinfo(single)] == ["Ethernet 2"])
     check("junk tolerated", beam.parse_win_netinfo("nonsense") == [] and beam.parse_win_netinfo({"ad": [1, None]}) == [])
     ifaces = beam.detect_interfaces()
+    print("INFO  interfaces here: " + "; ".join(
+        f"{i['name'] or '?'} ({i['kind']}{', direct' if beam.is_direct_link(i) else ''}"
+        f"{', ' + i['category'] if i.get('category') else ''}) {', '.join(i['ips'])}" for i in ifaces))
     check("this machine's interfaces detected without errors", isinstance(ifaces, list)
           and all({"name", "kind", "ips"} <= set(i) for i in ifaces), json.dumps(ifaces)[:200])
 

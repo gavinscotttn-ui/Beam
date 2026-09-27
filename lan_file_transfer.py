@@ -2008,7 +2008,7 @@ fieldset{border:0;margin:0;padding:0;min-width:0}
 .steps li{margin:4px 0}
 .speed{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:10px;margin:4px 0 14px}
 .gauge{padding:12px;border-radius:12px;background:var(--input);border:1px solid var(--line);text-align:center}
-.gauge b{display:block;font:300 26px/1.2 var(--font);font-variant-numeric:tabular-nums}
+.gauge b{display:block;font:300 22px/1.25 var(--font);font-variant-numeric:tabular-nums;white-space:nowrap}
 .gauge small{display:block;font:700 11.5px var(--chrome);color:var(--muted);margin-top:2px}
 .gauge .meter{margin-top:8px;height:8px}
 .login{max-width:400px;margin:48px auto;padding:30px 28px;text-align:center}
@@ -2030,6 +2030,7 @@ fieldset{border:0;margin:0;padding:0;min-width:0}
  .sk-c{min-width:92px}
  .sk kbd{display:none}
  .actions .btn.ghost{display:none}
+ .row .t .n,.live .t .n{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow-wrap:anywhere}
 }
 @media (pointer:coarse){.kb{display:none}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
@@ -2153,8 +2154,10 @@ JS = r"""(() => {
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
-const fmt = n => { if (n == null) return ""; const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return (i ? n.toFixed(1) : Math.round(n)) + " " + u[i]; };
-const left = s => !isFinite(s) || s <= 0 ? "" : s < 60 ? Math.ceil(s) + " s left" : s < 5400 ? Math.round(s / 60) + " min left" : (s / 3600).toFixed(1) + " h left";
+const NB = "\u00a0"; // numbers stay on the same line as their units
+const fmt = n => { if (n == null) return ""; const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return (i ? n.toFixed(1) : Math.round(n)) + NB + u[i]; };
+const left = s => !isFinite(s) || s <= 0 ? "" : (s < 60 ? Math.ceil(s) + NB + "s" : s < 5400 ? Math.round(s / 60) + NB + "min" : (s / 3600).toFixed(1) + NB + "h") + NB + "left";
+const wb = s => esc(s).replace(/([._])/g, "$1<wbr>"); // long dotted names can wrap after a dot
 const mbs = r => (r / 1048576 >= 100 ? Math.round(r / 1048576) : (r / 1048576).toFixed(1));
 const svg = (id, cls) => '<svg class="' + (cls || "ic") + '" aria-hidden="true"><use href="#' + id + '"/></svg>';
 const body = document.body, root = document.documentElement, D = body.dataset, PAGE = D.page || "";
@@ -2391,7 +2394,7 @@ if (q && live) {
       if (d.closest) h += '<div class="hint">No exact match. Closest results:</div>';
       for (const r of d.results) {
         h += '<a role="option" href="' + esc(r.url) + '"' + (r.kind === "f" ? " download" : "") + ">" + svg("f-" + r.icon, "fi") +
-             '<span class="t"><span class="n">' + esc(r.name) + "</span><small>" + esc(r.where) + "</small></span></a>";
+             '<span class="t"><span class="n">' + wb(r.name) + "</span><small>" + esc(r.where) + "</small></span></a>";
       }
       h += '<a class="more" href="/search?q=' + encodeURIComponent(v) + '">See all ' + d.total.toLocaleString() + " result" + (d.total === 1 ? "" : "s") + "</a>";
     }
@@ -2828,10 +2831,10 @@ async function runSpeed() {
   try {
     const p = await rttOf("/api/ping");
     if (p == null) throw new Error("Beam isn't answering");
-    gauge("Ping", (p < 10 ? p.toFixed(1) : Math.round(p)) + " ms", Math.max(0.05, 1 - p / 60));
-    const one = await dlTest(1, 4000); gauge("One", mbs(one) + " MB/s", one / 125e6);
-    const many = await dlTest(4, 4000); gauge("Many", mbs(many) + " MB/s", many / 125e6);
-    const upl = await ulTest(); gauge("Up", mbs(upl) + " MB/s", upl / 125e6);
+    gauge("Ping", (p < 10 ? p.toFixed(1) : Math.round(p)) + NB + "ms", Math.max(0.05, 1 - p / 60));
+    const one = await dlTest(1, 4000); gauge("One", mbs(one) + NB + "MB/s", one / 125e6);
+    const many = await dlTest(4, 4000); gauge("Many", mbs(many) + NB + "MB/s", many / 125e6);
+    const upl = await ulTest(); gauge("Up", mbs(upl) + NB + "MB/s", upl / 125e6);
     let t = "Downloads from " + (D.host || "the Beam PC") + " can reach about " + mbs(Math.max(one, many)) + " MB/s over this connection.";
     if (many > one * 1.2) t += " Several at once are clearly faster here, so use Mark several for batches.";
     t += " For comparison: wired gigabit manages about 110 MB/s, Wi-Fi 6 roughly 40–90, older Wi-Fi 5–30. If a real download is slower than this, the drive is the limit (USB 2.0 drives top out near 35 MB/s).";
@@ -3044,7 +3047,8 @@ def row_html(kind, sid, rel, name, size, mtime, where=None, parent_url=None) -> 
         head = f'<div class="row" data-kind="f" data-name="{en}" data-url="{eh}" data-size="{int(size or 0)}">'
     where_html = f"<small>{esc(where)}</small>" if where else ""
     return (f'{head}<span class="c1"><input type="checkbox" class="mk" tabindex="-1" aria-label="Mark {en}">'
-            f'<a class="nm" href="{href}"{attrs}>{ico}<span class="t"><span class="n">{en}</span>{where_html}</span></a></span>'
+            f'<a class="nm" href="{href}"{attrs}>{ico}<span class="t"><span class="n">{en.replace(".", ".<wbr>").replace("_", "_<wbr>")}</span>'
+            f'{where_html}</span></a></span>'
             f'<span class="num c-size">{human_size(size) if kind == "f" else ""}</span>'
             f'<span class="num c-date">{fmt_time(mtime)}</span><span class="ra">{acts}</span></div>')
 
@@ -4285,24 +4289,26 @@ def main() -> int:
         return 1
 
     real_port = server.server_port
-    threading.Thread(target=index.build, name="indexer", daemon=True).start()
-    threading.Thread(target=periodic_reindex, name="reindexer", daemon=True).start()
-    ifaces = netinfo.refresh_now()
+
+    def announce_cable():  # network details can take a moment on Windows, so don't hold up the banner
+        for iface in netinfo.refresh_now():
+            if is_direct_link(iface):
+                for ip in iface["ips"]:
+                    say(f"  Cable address (fastest):         http://{ip}:{real_port}/")
     shared = ", ".join(s["name"] for s in settings.shares()) or "nothing yet (open Settings)"
     say(line)
     say(f"  BEAM  |  LAN File Transfer  v{VERSION}")
     say("-" * 66)
     say(f"  Bookmark this on your other PC:  http://{HOSTNAME.lower()}:{real_port}/")
     say(f"  Backup address (can change):     http://{primary_ip()}:{real_port}/")
-    for iface in ifaces:
-        if is_direct_link(iface):
-            for ip in iface["ips"]:
-                say(f"  Cable address (fastest):         http://{ip}:{real_port}/")
     say(f"  Settings (on this PC):           http://localhost:{real_port}/settings")
     say(f"  Sharing: {shared}")
     say("-" * 66)
     say("  Leave this window open while you use Beam. Close it to stop.")
     say(line)
+    threading.Thread(target=index.build, name="indexer", daemon=True).start()
+    threading.Thread(target=periodic_reindex, name="reindexer", daemon=True).start()
+    threading.Thread(target=announce_cable, name="netinfo", daemon=True).start()
     log.info("Beam %s started on port %s", VERSION, real_port)
     if settings.first_run and IS_WINDOWS:
         webbrowser.open(f"http://localhost:{real_port}/settings")
