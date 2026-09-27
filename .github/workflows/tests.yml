@@ -20,5 +20,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Compile
         run: python -m py_compile lan_file_transfer.py
+      - name: Unit tests
+        run: python tests/unit_test.py
       - name: End-to-end smoke test
         run: python tests/smoke_test.py
