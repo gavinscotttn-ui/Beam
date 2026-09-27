@@ -1,0 +1,16 @@
+# Beam's own runtime files - beam_settings.json holds your password hash and
+# session secret, so it must never be committed.
+beam_settings.json
+beam_settings.*.json
+beam_settings.tmp
+beam.log
+beam.log.*
+
+# Python
+__pycache__/
+*.py[cod]
+
+# OS clutter
+.DS_Store
+Thumbs.db
+desktop.ini
