@@ -1882,11 +1882,6 @@ kbd{font:500 12px var(--font);padding:1px 7px;border-radius:5px;border:1px solid
 @keyframes spin{to{transform:rotate(360deg)}}
 .cable{display:inline-flex;align-items:center;gap:4px;padding:1px 7px;border-radius:9px;background:rgba(var(--m-rgb),.22);color:inherit;font:inherit;border:0;cursor:pointer}
 .cable[hidden]{display:none}
-.bat{position:relative;display:inline-block;width:22px;height:11px;border:1.5px solid currentColor;border-radius:2px;flex:none}
-.bat::after{content:"";position:absolute;right:-4px;top:2px;width:2px;height:4px;background:currentColor;border-radius:0 1px 1px 0}
-.bat i{position:absolute;left:1px;top:1px;bottom:1px;width:calc((100% - 2px) * var(--lvl,1));background:currentColor;border-radius:1px}
-.bat.low i{background:#ff5a5a}
-.bat[hidden]{display:none}
 /* ---- title bar ---- */
 .tbar{display:flex;align-items:center;gap:18px;padding:9px 20px;background:var(--bar);border-bottom:1px solid var(--bar-edge);box-shadow:0 1px 0 var(--m),0 10px 26px -12px rgba(var(--m-rgb),.55)}
 .brand{display:flex;align-items:center;gap:11px;color:var(--text);text-decoration:none!important;flex:none}
@@ -2335,8 +2330,8 @@ $$("[data-copy]").forEach(b => b.addEventListener("click", async () => {
 const q = $("#q");
 const focusSearch = () => { if (q) { q.focus(); q.select(); } else location.href = "/"; };
 
-/* ---- status bar: signal (really the round trip to Beam), clock, battery, indexing ---- */
-const sig = $("#sig"), clock = $("#clock"), bat = $("#bat"), sbIdx = $("#sbIdx"), idxText = $("#idx");
+/* ---- status bar: signal (really the round trip to Beam), clock, indexing ---- */
+const sig = $("#sig"), clock = $("#clock"), sbIdx = $("#sbIdx"), idxText = $("#idx");
 const bigClock = $("#bigClock"), bigDate = $("#bigDate");
 function tick() {
   if (!clock && !bigClock) return;
@@ -2346,10 +2341,6 @@ function tick() {
   setTimeout(tick, 60050 - Date.now() % 60000);
 }
 tick();
-if (bat && navigator.getBattery) navigator.getBattery().then(b => {
-  const upd = () => { bat.style.setProperty("--lvl", b.level); bat.classList.toggle("low", b.level < 0.15 && !b.charging); bat.title = Math.round(b.level * 100) + "%" + (b.charging ? ", charging" : ""); bat.hidden = false; };
-  upd(); b.addEventListener("levelchange", upd); b.addEventListener("chargingchange", upd);
-}).catch(() => {});
 let building = D.indexing === "1", offline = false, pingTimer = 0;
 const rtts = [];
 function setBars(n, label) { if (!sig) return; sig.dataset.bars = n; sig.setAttribute("aria-label", label); sig.title = label; }
@@ -3108,7 +3099,6 @@ BASE_HTML = """<!DOCTYPE html>
   <span class="gap"></span>
   %%LOCKICON%%
   <time id="clock">%%TIME%%</time>
-  <span class="bat" id="bat" role="img" aria-label="Battery" hidden><i></i></span>
 </div>
 <header class="tbar">
   <a class="brand" href="/" aria-label="Beam home"><span class="orb" aria-hidden="true"></span><span><b>Beam</b><small>LAN File Transfer</small></span></a>
@@ -3138,7 +3128,7 @@ BASE_HTML = """<!DOCTYPE html>
 
 NAV_HTML = """<form class="search" action="/search" method="get" role="search">
     <svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
-    <input id="q" type="search" name="q" value="%%QUERY%%" placeholder="Search every drive (typos are fine)" autocomplete="off" spellcheck="false" aria-label="Search files and folders" aria-controls="live" aria-expanded="false">
+    <input id="q" type="search" name="q" value="%%QUERY%%" placeholder="Search every drive" autocomplete="off" spellcheck="false" aria-label="Search files and folders" aria-controls="live" aria-expanded="false">
     <div id="live" class="live" role="listbox" aria-label="Search results" hidden></div>
   </form>
   <nav class="tools" aria-label="Quick settings">
